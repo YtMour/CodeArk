@@ -1,32 +1,46 @@
-## 1. 系统架构图 (System Architecture)
+- ## 1. 系统逻辑架构 (System Architecture)
 
-CodeArk 采用 **Agent-Server-Storage** 模型：
+  CodeArk 采用**分布式边缘计算**架构，将繁重的加解密与打包任务下放到客户端，服务端仅充当“大脑”与“信令中心”。
 
-- **Client (Agent):** 负责文件 IO 监听、任务切片、ZIP 封装、AES 加密。
-- **Server (Control Plane):** 负责任务调度指令下发、存储节点路由、元数据持久化、用户权限校验。
-- **Storage (Data Plane):** 物理载体，仅存储经过加密的 `.ark` 文件包。
+  ### 1.1 客户端设计 (The Ark-Client)
 
-## 2. 核心逻辑详解
+  客户端基于 **Go (Golang)** 开发，利用其天然的并发优势处理大文件 IO。
 
-### 2.1 静默备份触发算法 (Quiescence Algorithm)
+  - **FS-Watcher 模块：** 使用递归监听技术监控文件系统变更。
+  - **Executor 模块：** 负责 ZIP 压缩与 AES 加密。加密采用流式处理，确保在处理数 GB 大小的项目时，内存占用控制在 256MB 以内。
+  - **Uploader 模块：** 支持分片上传（Multipart Upload），针对大文件备份提供断点续传能力。
 
-为避免频繁 IO 导致性能下降，系统内置 `Watcher` 模块：
+  ### 1.2 服务端设计 (The Ark-Server)
 
-1. **事件截获：** 基于 `inotify` (Linux) 或 `ReadDirectoryChangesW` (Windows) 捕获文件写结束信号。
-2. **计时器重置：** 每次 IO 事件发生，重置 $T_{idle}$ 计时器。
-3. **阈值判定：** 当 $T_{now} - T_{last\_io} \ge T_{threshold}$（默认 600s）且 CPU 占用率 $< 20\%$ 时，启动备份流水线。
+  服务端提供 RESTful API 与 WebSocket 实时双向通信。
 
-### 2.2 加密保障机制 (Encryption Pipeline)
+  - **存储驱动抽象层 (Storage Driver Interface)：** * `S3 Adapter`: 适配阿里云 OSS、AWS S3、MinIO。
+    - `FileSystem Adapter`: 适配本地磁盘、局域网 SMB/NFS 挂载点。
+    - `SFTP Adapter`: 适配远程 VPS 存储。
+  - **元数据管理器：** 使用 PostgreSQL 存储备份历史、哈希指纹及任务配置，确保数据的一致性。
 
-系统对安全性有严格的序时要求：
+  ------
 
-- **Step 1:** 调用 `libzip` 将目标目录打包。
-- **Step 2:** 在 ZIP 头信息中注入用户设置的 `Archive-Password`。
-- **Step 3:** 生成 `Initialization Vector (IV)`，使用 `Master-Token` 通过 **AES-256-GCM** 对整个 ZIP 文件进行块加密。
-- **Step 4:** 生成 `.sntl` 封装格式，包含：`[Header][IV][Encrypted Payload][HMAC Tag]`。
+  ## 2. 核心工作流深度拆解 (Workflow Deep Dive)
 
-## 3. 技术栈选型理由
+  ### 2.1 封存工作流 (The Archiving Flow)
 
-- **Go (Backend & Client):** 静态编译保证了 EXE 客户端在虚拟机中的零依赖运行，并发处理大文件压缩效率极高。
-- **Vue 3 + Pinia (Frontend):** 响应式状态管理，支持多任务进度条实时刷新。
-- **Wails:** 相比 Electron，体积更小，内存占用极低，适合作为后台驻留程序。
+  1. **扫描器触发：** 检测到静默期满或收到手动指令。
+  2. **哈希比对：** 扫描文件树，计算当前状态快照，若与上次备份无差异则跳过。
+  3. **管道打包：** * Step A: 将筛选后的文件流送入 ZIP 压缩器。
+     - Step B: 为 ZIP 设置文件头密码。
+     - Step C: 将输出流通过管道 (Pipe) 直接送入 AES-256-GCM 加密器，避免产生中间临时明文文件。
+  4. **云端引渡：** 加密流直接推送至配置的存储节点。
+
+  ### 2.2 恢复工作流 (The Recovery Flow)
+
+  - **用户侧触发：** 在 Web 管理界面选择版本，点击“引渡回本地”。
+  - **多路径恢复：** 客户端接收指令，下载密文流。
+  - **本地解密：** 客户端调用本地存储的私钥解开 AES 层，还原为加密 ZIP，随后用户输入 ZIP 密码完成最终还原。
+
+  ------
+
+  ## 3. 安全性声明 (Security Specification)
+
+  - **零知识原则：** 服务端不存储用户的 ZIP 密码。即使服务端数据库泄露，攻击者也无法通过备份文件获取代码内容。
+  - **防篡改：** 每个备份包均附带 SHA-256 签名，下载恢复前会自动进行完整性校验。
